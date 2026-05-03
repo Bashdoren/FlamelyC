@@ -319,6 +319,12 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
             <div class="section-label" style="margin-bottom:8px;color:#ef4444;">СПИСОК ЗАБЛОКИРОВАННЫХ</div>
             <div id="banned-list" style="display:flex;flex-direction:column;gap:6px;max-height:140px;overflow-y:auto;"></div>
           </div>
+          <!-- Reset All Stats -->
+          <div style="background:rgba(245,158,11,0.08);border:1px solid rgba(245,158,11,0.3);border-radius:14px;padding:14px;">
+            <div class="section-label" style="margin-bottom:8px;color:#f59e0b;">🔄 СБРОС СТАТИСТИКИ</div>
+            <div style="font-size:11px;color:#6b7280;margin-bottom:10px;">Обнуляет wins/losses/kd/elo у ВСЕХ пользователей. Действие необратимо.</div>
+            <button onclick="adminResetAllStats()" style="width:100%;padding:10px;border-radius:10px;font-size:14px;font-family:'Bebas Neue',sans-serif;letter-spacing:1px;background:rgba(245,158,11,0.2);border:1px solid rgba(245,158,11,0.4);color:#f59e0b;cursor:pointer;">⚠️ ОБНУЛИТЬ ВСЕМ СТАТИСТИКУ</button>
+          </div>
         </div>
       </div>
 
@@ -426,9 +432,144 @@ body::after{content:'';position:fixed;inset:0;background-image:linear-gradient(r
   </div>
 </div>
 
-<!-- Firebase SDK — должны быть ДО основного скрипта -->
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-app-compat.js"></script>
-<script src="https://www.gstatic.com/firebasejs/10.12.0/firebase-database-compat.js"></script>
+
+
+<!-- Firebase REST API shim — без внешних зависимостей -->
+<script>
+(function(){
+  var DB_URL = 'https://flamely-78e17-default-rtdb.europe-west1.firebasedatabase.app';
+  var API_KEY = 'AIzaSyCECIk_JN-Kd2ulixB5NbgZSk6HHCFtIrc';
+
+  // Слушатели (polling каждые 2с вместо WebSocket)
+  var _listeners = {};
+  var _cache = {};
+  var _pollInterval = null;
+
+  function dbUrl(path){ return DB_URL + '/' + path.replace(/^\//, '') + '.json?auth=' + API_KEY; }
+
+  function get(path, cb){
+    fetch(dbUrl(path)).then(function(r){ return r.json(); }).then(function(d){ cb(d); }).catch(function(){ cb(null); });
+  }
+
+  function set(path, val, cb){
+    fetch(dbUrl(path), {method:'PUT', headers:{'Content-Type':'application/json'}, body:JSON.stringify(val)})
+      .then(function(){ if(cb) cb(); }).catch(function(){ if(cb) cb(); });
+  }
+
+  function update(path, val, cb){
+    fetch(dbUrl(path), {method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(val)})
+      .then(function(r){ return r.json(); }).then(function(){ if(cb) cb(); }).catch(function(){ if(cb) cb(); });
+  }
+
+  function push(path, val){
+    fetch(dbUrl(path), {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(val)}).catch(function(){});
+  }
+
+  function remove(path){
+    fetch(dbUrl(path), {method:'DELETE'}).catch(function(){});
+  }
+
+  function addListener(path, cb){
+    if(!_listeners[path]) _listeners[path] = [];
+    _listeners[path].push(cb);
+    // Fire immediately
+    get(path, function(d){ cb(d); });
+    startPolling();
+  }
+
+  function removeListener(path){
+    delete _listeners[path];
+  }
+
+  function startPolling(){
+    if(_pollInterval) return;
+    _pollInterval = setInterval(function(){
+      Object.keys(_listeners).forEach(function(path){
+        get(path, function(d){
+          var key = path;
+          var prev = JSON.stringify(_cache[key]);
+          var next = JSON.stringify(d);
+          if(prev !== next){
+            _cache[key] = d;
+            (_listeners[path]||[]).forEach(function(cb){ cb(d); });
+          }
+        });
+      });
+    }, 2000);
+  }
+
+  // Ref-like object
+  function Ref(path){
+    this._path = path;
+  }
+  Ref.prototype.set = function(val, cb){ set(this._path, val, cb); return this; };
+  Ref.prototype.update = function(val, cb){ update(this._path, val, cb); return this; };
+  Ref.prototype.push = function(val){ push(this._path, val); return this; };
+  Ref.prototype.remove = function(){ remove(this._path); return this; };
+  Ref.prototype.once = function(evt, cb){
+    get(this._path, function(d){
+      cb({ val: function(){ return d; } });
+    });
+    return this;
+  };
+  Ref.prototype.on = function(evt, cb){
+    var self = this;
+    addListener(this._path, function(d){
+      cb({ val: function(){ return d; } });
+    });
+    return this;
+  };
+  Ref.prototype.off = function(){ removeListener(this._path); return this; };
+  Ref.prototype.limitToLast = function(n){
+    // return self — filtering done client-side after fetch
+    return this;
+  };
+  Ref.prototype.orderByChild = function(){ return this; };
+  Ref.prototype.equalTo = function(){ return this; };
+
+  // Global db object
+  window.db = {
+    ref: function(path){ return new Ref(path); },
+    _update: function(updates, cb){
+      // Batch update via individual PATCHes
+      var paths = Object.keys(updates);
+      var done = 0;
+      if(!paths.length){ if(cb) cb(); return; }
+      // Group by top-level path
+      var grouped = {};
+      paths.forEach(function(p){
+        var parts = p.split('/').filter(Boolean);
+        var top = parts.slice(0, parts.length-1).join('/');
+        var key = parts[parts.length-1];
+        if(!grouped[top]) grouped[top] = {};
+        grouped[top][key] = updates[p];
+      });
+      var keys = Object.keys(grouped);
+      keys.forEach(function(top){
+        update(top, grouped[top], function(){
+          done++;
+          if(done === keys.length && cb) cb(null);
+        });
+      });
+    }
+  };
+
+  // Override db.ref().set on root for batch updates (adminResetAllStats)
+  var origRef = window.db.ref.bind(window.db);
+  window.db.ref = function(path){
+    var r = new Ref(path || '');
+    if(!path || path === ''){
+      r.update = function(updates, cb){ window.db._update(updates, cb); };
+    }
+    return r;
+  };
+
+  // Signal ready
+  window._firebaseReady = true;
+  if(window._appReady) window.initApp();
+})();
+</script>
+
 <script>
 // ============================================================
 // STATE
@@ -707,151 +848,9 @@ function renderBannedList(){
 // ============================================================
 // MATCH RESULT SYSTEM
 // ============================================================
-function getMatchHistory(){try{return JSON.parse(localStorage.getItem('flamely_matches')||'[]');}catch(e){return[];}}
-function saveMatchHistory(list){localStorage.setItem('flamely_matches',JSON.stringify(list));}
 
 function parseMatchIds(str){
   return str.split(/[\n,]+/).map(s=>s.trim()).filter(s=>s.length>0);
-}
-
-function resolveMatchPlayers(ids){
-  const all = getGlobalUsers();
-  return ids.map(id=>{
-    // try by id first, then by name
-    let u = all.find(u=>u.id.toLowerCase()===id.toLowerCase());
-    if(!u) u = all.find(u=>u.name.toLowerCase()===id.toLowerCase());
-    return u || null;
-  });
-}
-
-function previewMatchResult(){
-  const winIds = parseMatchIds(document.getElementById('match-winners-input').value);
-  const loseIds = parseMatchIds(document.getElementById('match-losers-input').value);
-  const eloWin = parseInt(document.getElementById('match-elo-win').value)||25;
-  const eloLose = parseInt(document.getElementById('match-elo-lose').value)||25;
-
-  if(!winIds.length && !loseIds.length){toast('❌ Введите хотя бы одного игрока');return;}
-
-  const winners = resolveMatchPlayers(winIds);
-  const losers = resolveMatchPlayers(loseIds);
-
-  let html = '<div style="margin-bottom:8px;"><span style="color:#10b981;font-weight:700;">🏆 ПОБЕДИТЕЛИ:</span></div>';
-  winIds.forEach((id,i)=>{
-    const u = winners[i];
-    html += '<div style="padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);">';
-    if(u) html += '<span style="color:#e5e7eb;">' + u.name + '</span> <span style="color:#4b5563;font-size:9px;">' + u.id + '</span> <span style="color:#10b981;float:right;">+' + eloWin + ' ELO</span>';
-    else html += '<span style="color:#ef4444;">❌ ' + id + ' — не найден</span>';
-    html += '</div>';
-  });
-
-  html += '<div style="margin:8px 0;"><span style="color:#ef4444;font-weight:700;">💀 ПРОИГРАВШИЕ:</span></div>';
-  loseIds.forEach((id,i)=>{
-    const u = losers[i];
-    html += '<div style="padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.05);">';
-    if(u) html += '<span style="color:#e5e7eb;">' + u.name + '</span> <span style="color:#4b5563;font-size:9px;">' + u.id + '</span> <span style="color:#ef4444;float:right;">-' + eloLose + ' ELO</span>';
-    else html += '<span style="color:#ef4444;">❌ ' + id + ' — не найден</span>';
-    html += '</div>';
-  });
-
-  const wrap = document.getElementById('match-result-preview');
-  document.getElementById('match-preview-content').innerHTML = html;
-  if(wrap) wrap.style.display = 'block';
-}
-
-function submitMatchResult(){
-  const winIds = parseMatchIds(document.getElementById('match-winners-input').value);
-  const loseIds = parseMatchIds(document.getElementById('match-losers-input').value);
-  const eloWin = parseInt(document.getElementById('match-elo-win').value)||25;
-  const eloLose = parseInt(document.getElementById('match-elo-lose').value)||25;
-
-  if(!winIds.length && !loseIds.length){toast('❌ Введите игроков');return;}
-
-  const winners = resolveMatchPlayers(winIds);
-  const losers = resolveMatchPlayers(loseIds);
-
-  const allUsers = getGlobalUsers();
-  let applied = 0;
-  const matchRecord = {
-    id: 'M' + Date.now(),
-    time: now(),
-    date: new Date().toLocaleDateString('ru'),
-    winners: [],
-    losers: [],
-    eloWin,
-    eloLose
-  };
-
-  // Apply to winners
-  winners.forEach((u, i)=>{
-    if(!u){return;}
-    u.elo = (u.elo||1000) + eloWin;
-    u.wins = (u.wins||0) + 1;
-    // recalc kd
-    u.kd = u.losses ? Math.round((u.wins/u.losses)*10)/10 : u.wins;
-    matchRecord.winners.push({id:u.id, name:u.name, eloChange:'+'+eloWin});
-    // if current user
-    if(u.id === STATE.user.id){
-      STATE.user.elo = u.elo;
-      STATE.user.wins = u.wins;
-      STATE.user.kd = u.kd;
-      saveData();
-    }
-    // save notification for them
-    addMatchNotif(u.id, {type:'win', eloChange:'+'+eloWin, matchId:matchRecord.id, time:now()});
-    applied++;
-  });
-
-  // Apply to losers
-  losers.forEach((u, i)=>{
-    if(!u){return;}
-    u.elo = Math.max(0, (u.elo||1000) - eloLose);
-    u.losses = (u.losses||0) + 1;
-    u.kd = u.losses ? Math.round(((u.wins||0)/u.losses)*10)/10 : 0;
-    matchRecord.losers.push({id:u.id, name:u.name, eloChange:'-'+eloLose});
-    if(u.id === STATE.user.id){
-      STATE.user.elo = u.elo;
-      STATE.user.losses = u.losses;
-      STATE.user.kd = u.kd;
-      saveData();
-    }
-    addMatchNotif(u.id, {type:'loss', eloChange:'-'+eloLose, matchId:matchRecord.id, time:now()});
-    applied++;
-  });
-
-  // Save updated global users
-  saveGlobalUsers(allUsers);
-
-  // Save match to history
-  const history = getMatchHistory();
-  history.unshift(matchRecord);
-  if(history.length > 50) history.splice(50);
-  saveMatchHistory(history);
-
-  // Clear inputs
-  document.getElementById('match-winners-input').value = '';
-  document.getElementById('match-losers-input').value = '';
-  document.getElementById('match-result-preview').style.display = 'none';
-
-  toast('✅ Результат матча записан для ' + applied + ' игроков');
-  renderMatchHistory();
-  renderPage();
-}
-
-function addMatchNotif(userId, data){
-  try{
-    const key = 'flamely_match_notif_' + userId;
-    const list = JSON.parse(localStorage.getItem(key)||'[]');
-    list.unshift(data);
-    if(list.length>20) list.splice(20);
-    localStorage.setItem(key, JSON.stringify(list));
-  }catch(e){}
-}
-
-function getMyMatchNotifs(){
-  try{
-    const key = 'flamely_match_notif_' + STATE.user.id;
-    return JSON.parse(localStorage.getItem(key)||'[]');
-  }catch(e){return [];}
 }
 
 function renderMatchHistory(){
@@ -1023,19 +1022,28 @@ function submitReport(){
 }
 
 // ============================================================
-// FIREBASE INIT
+// FIREBASE CONFIG — db объект создан REST-шимом выше
 // ============================================================
-const firebaseConfig = {
-  apiKey: "AIzaSyCECIk_JN-Kd2ulixB5NbgZSk6HHCFtIrc",
-  authDomain: "flamely-78e17.firebaseapp.com",
-  databaseURL: "https://flamely-78e17-default-rtdb.europe-west1.firebasedatabase.app",
-  projectId: "flamely-78e17",
-  storageBucket: "flamely-78e17.firebasestorage.app",
-  messagingSenderId: "673884240789",
-  appId: "1:673884240789:web:08c8e572d8a57a6c55949c"
-};
-firebase.initializeApp(firebaseConfig);
-const db = firebase.database();
+
+// ============================================================
+// FIREBASE FRIENDS HELPERS
+// ============================================================
+function saveFriends(){
+  if(!STATE.user || !STATE.user.id) return;
+  db.ref("friends/" + STATE.user.id).set(STATE.friends || []);
+}
+
+function loadFriends(){
+  if(!STATE.user || !STATE.user.id) return;
+  if(window._fbFriendsRef) window._fbFriendsRef.off();
+  window._fbFriendsRef = db.ref("friends/" + STATE.user.id);
+  window._fbFriendsRef.on("value", snap=>{
+    const newFriends = snap.val() || [];
+    STATE.friends = newFriends;
+    updateFriendsBadge();
+    if(STATE.currentTab==='friends'||STATE.currentTab==='home'||STATE.currentTab==='lobby') renderPage();
+  });
+}
 
 // ============================================================
 // FIREBASE HELPERS
@@ -1059,16 +1067,14 @@ function startUserSync(){
     const list = Object.values(data);
     STATE._fbUsersCache = list;
     // sync own stats if admin changed them
-    if(STATE.isLogged && STATE.user.id){
-      const me = list.find(function(u){return u.id===STATE.user.id;});
-      if(me && (me.elo!==STATE.user.elo || me.wins!==STATE.user.wins || me.losses!==STATE.user.losses)){
-        STATE.user.elo = me.elo||STATE.user.elo;
-        STATE.user.wins = me.wins||0;
-        STATE.user.losses = me.losses||0;
-        STATE.user.kd = me.kd||0;
-        saveData();
-        if(STATE.currentTab==='elo'||STATE.currentTab==='home'||STATE.currentTab==='profile') renderPage();
-      }
+    const me = list.find(function(u){return u.id===STATE.user.id;});
+    if(me && (me.elo!==STATE.user.elo || me.wins!==STATE.user.wins || me.losses!==STATE.user.losses)){
+      STATE.user.elo = me.elo||STATE.user.elo;
+      STATE.user.wins = me.wins||0;
+      STATE.user.losses = me.losses||0;
+      STATE.user.kd = me.kd||0;
+      saveData();
+      if(STATE.currentTab==='elo'||STATE.currentTab==='home'||STATE.currentTab==='profile') renderPage();
     }
     updateFriendsBadge();
   });
@@ -1101,9 +1107,23 @@ function syncRegisteredUsers(){
   STATE.registeredUsers = list;
 }
 
-// Mark offline on page unload
+// Mark offline and leave lobby on page unload
 window.addEventListener('beforeunload', function(){
-  if(STATE.user.id) db.ref('users/'+STATE.user.id+'/status').set('offline');
+  if(STATE.user.id){
+    db.ref('users/'+STATE.user.id+'/status').set('offline');
+    // Auto-leave lobby
+    var lobby = STATE._fbLobbyCache;
+    if(lobby){
+      var inA = (lobby.teamA||[]).find(function(p){return p.id===STATE.user.id;});
+      var inB = (lobby.teamB||[]).find(function(p){return p.id===STATE.user.id;});
+      if(inA || inB){
+        lobby.teamA = (lobby.teamA||[]).filter(function(p){return p.id!==STATE.user.id;});
+        lobby.teamB = (lobby.teamB||[]).filter(function(p){return p.id!==STATE.user.id;});
+        lobby.updatedAt = Date.now();
+        db.ref('lobby').set(lobby);
+      }
+    }
+  }
 });
 
 // --- LOBBY ---
@@ -1203,7 +1223,7 @@ function renderLobbyChat(){
   var el=document.getElementById('lc-messages');
   if(!el) return;
   var msgs = STATE._fbLobbyChatCache || [];
-  if(!msgs.length){el.innerHTML='<div style="text-align:center;color:#4b5563;font-size:11px;padding:20px;">Пока нет сообщений</div>';return;}
+  if(!msgs.length){el.innerHTML='<div style="text-align:center;color:#4b5563;font-size:11px;padding:20px;">💬 Будь первым! Напиши сообщение в лобби</div>';return;}
   var html='';
   msgs.forEach(function(m){
     var isMe=m.id===STATE.user.id;
@@ -1407,7 +1427,18 @@ function acceptFriendRequest(userId){
   STATE.friendRequests=STATE.friendRequests.filter(id=>id!==userId);
   if(!STATE.friends.includes(userId)) STATE.friends.push(userId);
   updateFriendsBadge();
-  const u=STATE.registeredUsers.find(r=>r.id===userId)||{name:userId};
+  saveFriends();
+  // Also add me to their friends list
+  db.ref('friends/'+userId).once('value', function(snap){
+    var theirFriends = snap.val() || [];
+    if(!theirFriends.includes(STATE.user.id)){
+      theirFriends.push(STATE.user.id);
+      db.ref('friends/'+userId).set(theirFriends);
+    }
+  });
+  // Remove from their sent requests perspective (clean up)
+  db.ref('friend_requests/'+STATE.user.id+'/'+userId).remove();
+  const u=getUserById(userId)||{name:userId};
   toast(`🤝 ${u.name} добавлен в друзья!`);
   saveData();
   renderPage();
@@ -1419,7 +1450,6 @@ function declineFriendRequest(userId){
   if(!STATE.declinedRequests) STATE.declinedRequests=[];
   STATE.declinedRequests.push(userId);
   updateFriendsBadge();
-  const u=STATE.registeredUsers.find(r=>r.id===userId)||{name:userId};
   toast(`❌ Заявка отклонена`);
   saveData();
   renderPage();
@@ -1430,6 +1460,12 @@ function removeFriend(userId){
   const u=getUserById(userId)||{name:userId};
   showConfirm(`Удалить ${u.name} из друзей?`, ()=>{
     STATE.friends=STATE.friends.filter(id=>id!==userId);
+    saveFriends();
+    // Remove me from their friends list too
+    db.ref('friends/'+userId).once('value', function(snap){
+      var theirFriends = (snap.val()||[]).filter(function(id){return id!==STATE.user.id;});
+      db.ref('friends/'+userId).set(theirFriends);
+    });
     toast('🗑️ Удалён из друзей');
     saveData();
     renderPage();
@@ -2143,6 +2179,30 @@ function generateId(){
 // ADMIN EXTRA
 // ============================================================
 function adminGiveElo(){adminGiveEloById();}
+
+function adminResetAllStats(){
+  showConfirm('ОБНУЛИТЬ СТАТИСТИКУ ВСЕМ ПОЛЬЗОВАТЕЛЯМ?\n\nЭто действие необратимо!', function(){
+    var users = STATE._fbUsersCache || [];
+    var updates = {};
+    users.forEach(function(u){
+      updates['users/'+u.id+'/wins'] = 0;
+      updates['users/'+u.id+'/losses'] = 0;
+      updates['users/'+u.id+'/kd'] = 0;
+      updates['users/'+u.id+'/elo'] = 1000;
+    });
+    db.ref().update(updates, function(err){
+      if(err){ toast('❌ Ошибка: '+err.message); return; }
+      // Reset own stats too
+      STATE.user.wins = 0;
+      STATE.user.losses = 0;
+      STATE.user.kd = 0;
+      STATE.user.elo = 1000;
+      saveData();
+      toast('✅ Статистика всех игроков обнулена!');
+      renderPage();
+    });
+  });
+}
 function adminChangeNick(){
   const id=prompt('ID игрока');const val=prompt('Новый ник');
   if(!id||!val)return;
@@ -2225,32 +2285,60 @@ function showRegisterFromLogin(){
 function submitLogin(){
   const nick = document.getElementById('login-nick-input').value.trim();
   const pass = document.getElementById('login-pass-input').value;
-  const users = STATE._fbUsersCache||[];
-  const found = users.find(u=>u.name.toLowerCase()===nick.toLowerCase());
-  if(!found){ loginError('Игрок не найден'); return; }
+  if(!nick){loginError('Введите никнейм');return;}
+  if(!pass){loginError('Введите пароль');return;}
 
-  // Load that user's saved data to check password
-  try{
+  // Wait for Firebase users cache to load
+  const tryLogin = function(){
+    const users = STATE._fbUsersCache||[];
+    const found = users.find(u=>u.name.toLowerCase()===nick.toLowerCase());
+    if(!found){ loginError('Игрок не найден'); return; }
+
+    // Check password from localStorage (account key)
     const raw = localStorage.getItem('flamely_acc_'+found.id);
     if(raw){
-      const acc = JSON.parse(raw);
-      if(acc._pass && acc._pass !== btoa(pass)){ loginError('Неверный пароль'); return; }
+      try{
+        const acc = JSON.parse(raw);
+        if(acc._pass && acc._pass !== btoa(pass)){ loginError('Неверный пароль'); return; }
+      }catch(e){}
+    } else if(found._pass) {
+      // If stored in Firebase (legacy)
+      if(found._pass !== btoa(pass)){ loginError('Неверный пароль'); return; }
     }
-  }catch(e){}
+    // else: no password stored yet, allow login (first login on new device)
 
-  // Restore user
-  STATE.user.id = found.id;
-  STATE.user.name = found.name;
-  STATE.user.emoji = found.emoji;
-  STATE.user.elo = found.elo || 1000;
-  STATE.user.isPrime = found.isPrime || false;
-  STATE.user.verified = found.verified || false;
-  STATE.user.avatar = found.avatar || null;
-  STATE.isLogged = true;
-  saveData();
-  document.getElementById('login-screen').style.display='none';
-  startFirebase();
-  toast('✅ Добро пожаловать, ' + STATE.user.name + '!');
+    // Restore user
+    STATE.user.id = found.id;
+    STATE.user.name = found.name;
+    STATE.user.emoji = found.emoji;
+    STATE.user.elo = found.elo || 1000;
+    STATE.user.isPrime = found.isPrime || false;
+    STATE.user.verified = found.verified || false;
+    STATE.user.avatar = found.avatar || null;
+    STATE.user.wins = found.wins || 0;
+    STATE.user.losses = found.losses || 0;
+    STATE.user.kd = found.kd || 0;
+    // Restore password if we have it
+    if(raw){ try{ STATE.user._pass = JSON.parse(raw)._pass; }catch(e){} }
+    STATE.isLogged = true;
+    saveData();
+    document.getElementById('login-screen').style.display='none';
+    document.getElementById('login-error').style.display='none';
+    startFirebase();
+    toast('✅ Добро пожаловать, ' + STATE.user.name + '!');
+  };
+
+  if(STATE._fbUsersCache && STATE._fbUsersCache.length > 0){
+    tryLogin();
+  } else {
+    // Firebase not loaded yet — wait a bit
+    document.getElementById('login-error').textContent = '⏳ Загружаем данные...';
+    document.getElementById('login-error').style.display='block';
+    setTimeout(function(){
+      document.getElementById('login-error').style.display='none';
+      tryLogin();
+    }, 1500);
+  }
 }
 
 function loginError(msg){
@@ -2259,7 +2347,21 @@ function loginError(msg){
 }
 
 function logoutUser(){
-  if(STATE.user.id) db.ref('users/'+STATE.user.id+'/status').set('offline');
+  if(STATE.user.id){
+    db.ref('users/'+STATE.user.id+'/status').set('offline');
+    // Leave lobby on logout
+    var lobby = STATE._fbLobbyCache;
+    if(lobby){
+      var inA = (lobby.teamA||[]).find(function(p){return p.id===STATE.user.id;});
+      var inB = (lobby.teamB||[]).find(function(p){return p.id===STATE.user.id;});
+      if(inA || inB){
+        lobby.teamA = (lobby.teamA||[]).filter(function(p){return p.id!==STATE.user.id;});
+        lobby.teamB = (lobby.teamB||[]).filter(function(p){return p.id!==STATE.user.id;});
+        lobby.updatedAt = Date.now();
+        db.ref('lobby').set(lobby);
+      }
+    }
+  }
   // detach listeners
   if(_fbUsersRef){_fbUsersRef.off();_fbUsersRef=null;}
   if(_fbLobbyRef){_fbLobbyRef.off();_fbLobbyRef=null;}
@@ -2267,33 +2369,48 @@ function logoutUser(){
   if(_fbReqRef){_fbReqRef.off();_fbReqRef=null;}
   if(_fbChatRef){_fbChatRef.off();_fbChatRef=null;}
   if(_fbLobbyChatRef){_fbLobbyChatRef.off();_fbLobbyChatRef=null;}
+  if(window._fbFriendsRef){window._fbFriendsRef.off();window._fbFriendsRef=null;}
   STATE.isLogged = false;
   STATE._fbUsersCache=[];STATE._fbLobbyCache=null;STATE._fbMatchCache=[];STATE._fbIncomingReqs=[];
+  STATE.friends=[];STATE.sentRequests=[];STATE.friendRequests=[];STATE.declinedRequests=[];
   STATE.user = {id:'',name:'',emoji:'🔥',isPrime:false,elo:1000,wins:0,losses:0,kd:0,avatar:null,verified:false,_pass:null};
   saveData();
   document.getElementById('reg-screen').style.display='none';
   document.getElementById('login-screen').style.display='flex';
   document.getElementById('login-nick-input').value='';
   document.getElementById('login-pass-input').value='';
+  toast('👋 Вы вышли из аккаунта');
 }
 
-// ============================================================
-// INIT
-// ============================================================
-loadData();
 
+// ============================================================
+// INIT — вызывается после загрузки Firebase SDK
+// ============================================================
 function escHtml(str){
   return String(str||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-// Always sync users from Firebase (needed for login nick check)
-startUserSync();
+window.initApp = function(){
+  loadData();
 
-if(!STATE.isLogged){
-  document.getElementById('login-screen').style.display='flex';
-} else {
-  startFirebase();
-}
+  // Always sync users from Firebase (needed for login nick check)
+  startUserSync();
+
+  if(!STATE.isLogged){
+    document.getElementById('login-screen').style.display='flex';
+  } else {
+    startFirebase();
+  }
+
+  setInterval(function(){
+    if(STATE.isLogged && STATE.user.id){
+      saveData();
+      db.ref('users/'+STATE.user.id+'/lastSeen').set(Date.now());
+      db.ref('users/'+STATE.user.id+'/status').set('online');
+      checkMatchNotifs();
+    }
+  },10000);
+};
 
 function startFirebase(){
   startUserSync();
@@ -2301,18 +2418,13 @@ function startFirebase(){
   startMatchSync();
   startReqSync();
   registerCurrentUser();
+  loadFriends();
   renderPage();
 }
 
-// Auto save + heartbeat
-setInterval(function(){
-  if(STATE.isLogged && STATE.user.id){
-    saveData();
-    db.ref('users/'+STATE.user.id+'/lastSeen').set(Date.now());
-    db.ref('users/'+STATE.user.id+'/status').set('online');
-    checkMatchNotifs();
-  }
-},10000);
+// Сигнализируем что основной код готов
+window._appReady = true;
+if(window._firebaseReady) window.initApp();
 </script>
 <!-- LOBBY CHAT MODAL -->
 <div id="lobby-chat-modal" class="modal-bg">
